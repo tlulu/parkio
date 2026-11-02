@@ -18,7 +18,6 @@ pub struct AsyncTask {
 // Sends a message to the runtime thread to continue work on the task.
 struct TaskWaker {
     task_id: usize,
-    thread: Thread,
     sender: Sender<usize>, // A copy of the runtime's Sender.
 }
 
@@ -78,15 +77,19 @@ impl Runtime {
                 if self.pending_tasks == 0 {
                     break;
                 }
-                println!("[Runtime] Parking");
-                thread::park();
+                println!("[Runtime] Blocking");
+                // recv is a blocking call until a new message arrives.
+                let task_id = self
+                    .receiver
+                    .recv()
+                    .expect("this should be unreachable because runtime owns sender");
+                self.task_queue.push_back(task_id);
                 continue;
             };
 
             if let Some(task) = self.task_map.get_mut(&task_id) {
                 let waker = get_waker(TaskWaker {
                     task_id: task_id,
-                    thread: current(), // TODO add threadpool.
                     sender: self.sender.clone(),
                 });
                 let mut context = Context::from_waker(&waker);
@@ -199,7 +202,6 @@ fn clone(w: WakerData) -> RawWaker {
 fn wake(w: WakerData) {
     let typed: *const TaskWaker = w as *const TaskWaker;
     let task_waker: &TaskWaker = unsafe { &*typed };
-    task_waker.thread.unpark();
     let _ = task_waker.sender.send(task_waker.task_id);
 }
 
