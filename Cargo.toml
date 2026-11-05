@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 mio = { version = "1.2.4", features = ["net", "os-poll"] }
+threadpool = "1.0"

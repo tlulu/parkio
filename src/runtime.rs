@@ -1,46 +1,59 @@
 use mio::{Events, Interest, Registry, Token};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
-    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
-    thread::{self, JoinHandle, Thread, current},
+    task::{Context, Poll, Wake, Waker},
+    thread::{self, JoinHandle},
 };
+use threadpool::ThreadPool;
 
-pub struct AsyncTask {
-    f: Pin<Box<dyn Future<Output = ()>>>,
+use crate::runtime::TaskState::{Idle, Notified, Scheduled};
+
+type AsyncTask = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+// The states transition in two paths:
+// 1. Idle -> Scheduled -> Notified
+// 2. Idle -> Scheduled
+enum TaskState {
+    Idle,      // The initial state of the task
+    Scheduled, // The task has been scheduled. The task is either running or is blocked.
+    Notified,  // The scheduled task is woken up
 }
 
 // Sends a message to the runtime thread to continue work on the task.
 struct TaskWaker {
     task_id: usize,
-    sender: Sender<usize>, // A copy of the runtime's Sender.
+    sender: Sender<Msg>, // A copy of the runtime's Sender.
 }
 
-// An single-threaded runtime for running async tasks.
-//
-// This runtime uses the main thread to work on tasks concurrently.
-// The main worker pulls work from the task queue and parks until there is no work.
-// The worker resumes work via the TaskWaker which is stored on the heap.
+// Messages sent to the runtime from client threads or the runtime's own worker threads.
+enum Msg {
+    Wake(usize),             // Schedule a task into the task queue.
+    Yield(usize, AsyncTask), // Task is blocked - return it back to the runtime
+    Finish(usize),           // The task is finished
+}
 
-// The runtime creates a separate thread that listens for OS events.
-// This event listener is handled by mio::Poll, a low level abstraction for epoll, kqueue, IOCP that returns
+// The runtime uses the main thread to run async tasks.
+// Tasks get queued in a mpsc channel and are processed concurrently.
+
+// For OS events, the runtime listens on a separate thread.
+// This event listener uses mio::Poll, a low level abstraction for epoll, kqueue, IOCP that returns
 // events by the OS when IO is ready to proceed.
 
-// The runtime finishes when there are no pending tasks left in the queue.
-
-// TODO keep the runtime running even if there are no pending tasks, like an ExecutorService.
+// The runtime finishes when there are no pending tasks.
 pub struct Runtime {
-    task_queue: VecDeque<usize>,
-    task_map: HashMap<usize, AsyncTask>,
-    pending_tasks: u32,
-    sender: Sender<usize>,
-    receiver: Receiver<usize>,
+    tasks: HashMap<usize, AsyncTask>,
+    task_states: HashMap<usize, TaskState>,
+    pending_tasks: usize,
     next_task_id: usize,
+    sender: Sender<Msg>,
+    receiver: Receiver<Msg>,
+    threadpool: ThreadPool,
 
     // IO event listener
     pub io_registry: Arc<Registry>,
@@ -50,12 +63,13 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    pub fn spawn(&mut self, f: Pin<Box<dyn Future<Output = ()>>>) {
-        let async_task = AsyncTask { f: f };
-        self.task_queue.push_back(self.next_task_id);
-        self.task_map.insert(self.next_task_id, async_task);
-        self.pending_tasks += 1;
+    pub fn spawn(&mut self, async_task: AsyncTask) {
+        let task_id = self.next_task_id;
+        self.tasks.insert(task_id, async_task);
+        self.task_states.insert(task_id, Idle);
         self.next_task_id += 1;
+        self.pending_tasks += 1;
+        let _ = self.sender.send(Msg::Wake(task_id));
     }
 
     pub fn register_io<T: mio::event::Source>(
@@ -68,46 +82,71 @@ impl Runtime {
     }
 
     pub fn start(&mut self) {
-        loop {
-            for task_id in self.receiver.try_iter() {
-                self.task_queue.push_back(task_id);
-            }
-
-            let Some(task_id) = self.task_queue.pop_front() else {
-                if self.pending_tasks == 0 {
-                    break;
-                }
-                println!("[Runtime] Blocking");
-                // recv is a blocking call until a new message arrives.
-                let task_id = self
-                    .receiver
-                    .recv()
-                    .expect("this should be unreachable because runtime owns sender");
-                self.task_queue.push_back(task_id);
-                continue;
-            };
-
-            if let Some(task) = self.task_map.get_mut(&task_id) {
-                let waker = get_waker(TaskWaker {
-                    task_id: task_id,
-                    sender: self.sender.clone(),
-                });
-                let mut context = Context::from_waker(&waker);
-
-                println!("[Runtime] working on task {task_id}");
-                match task.f.as_mut().poll(&mut context) {
-                    Poll::Ready(_) => {
-                        self.task_map.remove(&task_id);
-                        self.pending_tasks -= 1
+        while self.pending_tasks > 0 {
+            // recv is a blocking call until a new message arrives.
+            let msg = self.receiver.recv().unwrap();
+            match msg {
+                Msg::Wake(task_id) => {
+                    if let Some(state) = self.task_states.get(&task_id) {
+                        match state {
+                            Idle => {
+                                if let Some(task) = self.tasks.remove(&task_id) {
+                                    let sender = self.sender.clone();
+                                    self.task_states.insert(task_id, Scheduled);
+                                    self.threadpool.execute(move || {
+                                        Self::process(task, task_id, sender);
+                                    });
+                                }
+                            }
+                            Scheduled => {
+                                // There can a scenario where wake is called before Poll::Pending is returned
+                                // We need to track tasks that were notified so we can wake them up.
+                                self.task_states.insert(task_id, Notified);
+                            }
+                            Notified => {}
+                        }
                     }
-                    Poll::Pending => {}
+                }
+                Msg::Finish(task_id) => {
+                    self.pending_tasks -= 1;
+                    self.task_states.remove(&task_id);
+                }
+                Msg::Yield(task_id, task) => {
+                    self.tasks.insert(task_id, task);
+
+                    if let Some(state) = self.task_states.get(&task_id) {
+                        match state {
+                            Notified => {
+                                // Re-schedule the task
+                                self.task_states.insert(task_id, Idle);
+                                let _ = self.sender.send(Msg::Wake(task_id));
+                            }
+                            _ => {
+                                self.task_states.insert(task_id, Idle);
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
-    pub fn new() -> Self {
-        let (sender, receiver) = mpsc::channel();
+    fn process(mut task: AsyncTask, task_id: usize, sender: Sender<Msg>) {
+        let waker = Waker::from(Arc::new(TaskWaker {
+            task_id,
+            sender: sender.clone(),
+        }));
+        let mut context = Context::from_waker(&waker);
+
+        println!("[Thread] working on task {task_id}");
+        let _ = match task.as_mut().poll(&mut context) {
+            Poll::Ready(_) => sender.send(Msg::Finish(task_id)),
+            Poll::Pending => sender.send(Msg::Yield(task_id, task)),
+        };
+    }
+
+    pub fn new(poolsize: usize) -> Self {
+        let (sender, receiver): (Sender<Msg>, Receiver<Msg>) = mpsc::channel();
         let poll = mio::Poll::new().expect("[Runtime] Failed to initialize mio::Poll");
         let registry = Arc::new(
             poll.registry()
@@ -120,18 +159,18 @@ impl Runtime {
         let io_waker = mio::Waker::new(&poll.registry(), IO_THREAD_SHUTDOWN_TOKEN)
             .expect("[Runtime] Failed to initialize mio Waker");
 
-        let runtime_thread = current();
         let io_thread_handle = thread::spawn(move || {
-            Self::io_listener(runtime_thread, poll, io_sender, shutdown_clone);
+            Self::io_listener(poll, io_sender, shutdown_clone);
         });
 
         Self {
-            task_queue: VecDeque::new(),
-            task_map: HashMap::new(),
-            pending_tasks: 0,
+            tasks: HashMap::new(),
+            task_states: HashMap::new(),
             sender,
             receiver,
+            pending_tasks: 0,
             next_task_id: 0,
+            threadpool: ThreadPool::new(poolsize),
             io_registry: registry,
             io_waker: io_waker,
             io_listener_shutdown: io_listener_shutdown,
@@ -140,9 +179,8 @@ impl Runtime {
     }
 
     fn io_listener(
-        runtime_thread: Thread,
         mut io_poll: mio::Poll,
-        sender: Sender<usize>,
+        sender: Sender<Msg>,
         io_listener_shutdown: Arc<AtomicBool>,
     ) {
         let mut events = Events::with_capacity(1024);
@@ -162,15 +200,14 @@ impl Runtime {
                     }
                     Token(task_id) => {
                         println!("[Runtime] Received OS event for task {task_id}");
-                        let _ = sender.send(task_id);
-                        runtime_thread.unpark();
+                        let _ = sender.send(Msg::Wake(task_id));
                     }
                 }
             }
         }
     }
 
-    fn stop_listener(&mut self) {
+    fn stop_io_listener(&mut self) {
         self.io_listener_shutdown.store(true, Ordering::Relaxed);
         let _ = self.io_waker.wake();
         if let Some(handle) = self.io_thread_handle.take() {
@@ -181,41 +218,17 @@ impl Runtime {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        self.stop_listener();
+        self.stop_io_listener();
     }
-}
-
-fn get_waker(task_waker: TaskWaker) -> Waker {
-    let p: *mut TaskWaker = Box::into_raw(Box::new(task_waker));
-    let waker = my_waker(p as *const ());
-    return waker;
 }
 
 const IO_THREAD_SHUTDOWN_TOKEN: Token = Token(usize::MAX);
 
-type WakerData = *const ();
-
-fn clone(w: WakerData) -> RawWaker {
-    my_raw_waker(w)
-}
-
-fn wake(w: WakerData) {
-    let typed: *const TaskWaker = w as *const TaskWaker;
-    let task_waker: &TaskWaker = unsafe { &*typed };
-    let _ = task_waker.sender.send(task_waker.task_id);
-}
-
-fn wake_by_ref(w: WakerData) {
-    wake(w)
-}
-fn drop(_: WakerData) {}
-
-static MY_VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-
-fn my_raw_waker(w: WakerData) -> RawWaker {
-    RawWaker::new(w, &MY_VTABLE)
-}
-
-fn my_waker(w: WakerData) -> Waker {
-    unsafe { Waker::from_raw(my_raw_waker(w)) }
+impl Wake for TaskWaker {
+    fn wake(self: Arc<Self>) {
+        let _ = self.sender.send(Msg::Wake(self.task_id));
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        let _ = self.sender.send(Msg::Wake(self.task_id));
+    }
 }

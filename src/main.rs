@@ -33,7 +33,7 @@ async fn yield_once(counter: Arc<AtomicUsize>) {
 }
 
 fn test_runtime() {
-    let mut runtime = Runtime::new();
+    let mut runtime = Runtime::new(4);
 
     let counter = Arc::new(AtomicUsize::new(0));
     for _ in 0..100 {
@@ -63,7 +63,7 @@ fn test_runtime_with_io() -> io::Result<()> {
     server_sock.set_nonblocking(true)?;
     let mut server = mio::net::TcpStream::from_std(server_sock);
 
-    let mut runtime = Runtime::new();
+    let mut runtime = Runtime::new(4);
 
     // Client task
     runtime.spawn(Box::pin(async move {

@@ -6,7 +6,7 @@ use std::{
 };
 
 use mio::net::TcpStream;
-use std::io::{Read, Write};
+use std::io::{Read};
 
 /*
  ******* Ready Once *******
