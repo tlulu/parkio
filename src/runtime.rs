@@ -72,6 +72,9 @@ impl Runtime {
         let _ = self.sender.send(Msg::Wake(task_id));
     }
 
+    // TODO decouple task and io event.
+    // A task can have multiple IO events.
+    // Right now a task can only listen to one IO event.
     pub fn register_io<T: mio::event::Source>(
         &mut self,
         source: &mut T,
